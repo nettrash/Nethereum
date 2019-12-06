@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -13,17 +15,17 @@ namespace Nethereum.JsonRpc.Client
 {
     public class RpcClient : ClientBase
     {
-        private const int NUMBER_OF_SECONDS_TO_RECREATE_HTTP_CLIENT = 60;
+        private readonly int CONNECTION_LIMIT = 2000; //max 2000 connections
+        private readonly int CONNECTION_LEASE_TIMEOUT = 10000; //10 seconds for reconnect
+
         private readonly AuthenticationHeaderValue _authHeaderValue;
         private readonly Uri _baseUrl;
         private readonly HttpClientHandler _httpClientHandler;
         private readonly ILog _log;
         private readonly JsonSerializerSettings _jsonSerializerSettings;
-        private volatile bool _firstHttpClient;
-        private HttpClient _httpClient;
-        private HttpClient _httpClient2;
-        private DateTime _httpClientLastCreatedAt;
-        private readonly object _lockObject = new object();
+        private static readonly object _lockObject = new object();
+        private readonly HttpClient _httpClient;
+        private static volatile Dictionary<string, HttpClient> _httpClients = new Dictionary<string, HttpClient>();
 
         public RpcClient(Uri baseUrl, AuthenticationHeaderValue authHeaderValue = null,
             JsonSerializerSettings jsonSerializerSettings = null, HttpClientHandler httpClientHandler = null, ILog log = null)
@@ -41,42 +43,43 @@ namespace Nethereum.JsonRpc.Client
             _jsonSerializerSettings = jsonSerializerSettings;
             _httpClientHandler = httpClientHandler;
             _log = log;
-            CreateNewHttpClient();
+            _httpClient = GetClient();
         }
 
-        protected override async Task<RpcResponseMessage> SendAsync(RpcRequestMessage request, string route = null)
+        protected override async Task<RpcResponseMessage> SendAsync(RpcRequestMessage rpcRequestMessage, string route = null)
         {
             var logger = new RpcLogger(_log);
+            var cancellationTokenSource = new CancellationTokenSource();
             try
             {
-                var httpClient = GetOrCreateHttpClient();
-                var rpcRequestJson = JsonConvert.SerializeObject(request, _jsonSerializerSettings);
+                var rpcRequestJson = JsonConvert.SerializeObject(rpcRequestMessage, _jsonSerializerSettings);
                 var httpContent = new StringContent(rpcRequestJson, Encoding.UTF8, "application/json");
-                var cancellationTokenSource = new CancellationTokenSource();
                 cancellationTokenSource.CancelAfter(ConnectionTimeout);
 
                 logger.LogRequest(rpcRequestJson);
 
-                var httpResponseMessage = await httpClient.PostAsync(route, httpContent, cancellationTokenSource.Token).ConfigureAwait(false);
-                httpResponseMessage.EnsureSuccessStatusCode();
-
-                var stream = await httpResponseMessage.Content.ReadAsStreamAsync();
-                using (var streamReader = new StreamReader(stream))
-                using (var reader = new JsonTextReader(streamReader))
+                using (var httpResponseMessage = await _httpClient.PostAsync(route, httpContent, cancellationTokenSource.Token).ConfigureAwait(false))
                 {
-                    var serializer = JsonSerializer.Create(_jsonSerializerSettings);
-                    var message =  serializer.Deserialize<RpcResponseMessage>(reader);
+                    httpResponseMessage.EnsureSuccessStatusCode();
 
-                    logger.LogResponse(message);
-                    
-                    return message;
+                    var stream = await httpResponseMessage.Content.ReadAsStreamAsync();
+                    using (var streamReader = new StreamReader(stream))
+                    using (var reader = new JsonTextReader(streamReader))
+                    {
+                        var serializer = JsonSerializer.Create(_jsonSerializerSettings);
+                        var message = serializer.Deserialize<RpcResponseMessage>(reader);
+
+                        logger.LogResponse(message);
+
+                        return message;
+                    }
                 }
             }
-            catch(TaskCanceledException ex)
+            catch (TaskCanceledException ex)
             {
-                 var exception = new RpcClientTimeoutException($"Rpc timeout after {ConnectionTimeout.TotalMilliseconds} milliseconds", ex);
-                 logger.LogException(exception);
-                 throw exception;
+                var exception = new RpcClientTimeoutException($"Rpc timeout after {ConnectionTimeout.TotalMilliseconds} milliseconds", ex);
+                logger.LogException(exception);
+                throw exception;
             }
             catch (Exception ex)
             {
@@ -84,18 +87,10 @@ namespace Nethereum.JsonRpc.Client
                 logger.LogException(exception);
                 throw exception;
             }
-        }
-
-       
-
-        private HttpClient GetOrCreateHttpClient()
-        {
-            lock (_lockObject)
+            finally
             {
-                var timeSinceCreated = DateTime.UtcNow - _httpClientLastCreatedAt;
-                if (timeSinceCreated.TotalSeconds > NUMBER_OF_SECONDS_TO_RECREATE_HTTP_CLIENT)
-                    CreateNewHttpClient();
-                return GetClient();
+                cancellationTokenSource.Cancel();
+                cancellationTokenSource.Dispose();
             }
         }
 
@@ -103,28 +98,20 @@ namespace Nethereum.JsonRpc.Client
         {
             lock (_lockObject)
             {
-                return _firstHttpClient ? _httpClient : _httpClient2;
+                if (_httpClients.ContainsKey(_baseUrl.AbsoluteUri))
+                {
+                    return _httpClients[_baseUrl.AbsoluteUri];
+                }
+                var httpClient = _httpClientHandler != null ? new HttpClient(_httpClientHandler) : new HttpClient();
+                httpClient.DefaultRequestHeaders.Authorization = _authHeaderValue;
+                httpClient.BaseAddress = _baseUrl;
+                httpClient.DefaultRequestHeaders.ConnectionClose = false; //keepAlive by default for reuse connection
+                var servicePoint = ServicePointManager.FindServicePoint(_baseUrl);
+                servicePoint.ConnectionLimit = CONNECTION_LIMIT;
+                servicePoint.ConnectionLeaseTimeout = CONNECTION_LEASE_TIMEOUT;
+                _httpClients.Add(_baseUrl.AbsoluteUri, httpClient); //store for reuse
+                return httpClient;
             }
-        }
-
-        private void CreateNewHttpClient()
-        {
-            var httpClient = _httpClientHandler != null ? new HttpClient(_httpClientHandler) : new HttpClient();
-            httpClient.DefaultRequestHeaders.Authorization = _authHeaderValue;
-            httpClient.BaseAddress = _baseUrl;
-            _httpClientLastCreatedAt = DateTime.UtcNow;
-            if (_firstHttpClient)
-                lock (_lockObject)
-                {
-                    _firstHttpClient = false;
-                    _httpClient2 = httpClient;
-                }
-            else
-                lock (_lockObject)
-                {
-                    _firstHttpClient = true;
-                    _httpClient = httpClient;
-                }
         }
     }
 }
